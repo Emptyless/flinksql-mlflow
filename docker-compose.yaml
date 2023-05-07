@@ -1,0 +1,276 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:13
+    ports:
+      - "5432:5432"
+    profiles:
+      - mlflow
+      - fullstack
+    environment:
+      - POSTGRES_DB=mlflowdb
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    volumes:
+      - database:/var/lib/postgresql/data
+
+  minio:
+    image: minio/minio:RELEASE.2023-05-04T21-44-30Z
+    entrypoint: sh
+    command: -c 'mkdir -p /data/ml-bucket && minio server /data --console-address ":9001"'
+    profiles:
+      - mlflow
+      - fullstack
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio_data:/data
+
+  mlflow:
+    image: mlflow:v2.3.1-postgres
+    build:
+      context: mlflow
+      dockerfile: Dockerfile
+    profiles:
+      - mlflow
+      - fullstack
+    ports:
+      - "5001:5001"
+    volumes:
+      - mlflow_artifacts:/mlruns
+    environment:
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+    command: >
+      mlflow server
+      --backend-store-uri
+      postgresql://postgres:postgres@postgres:5432/mlflowdb
+      --default-artifact-root
+      s3://ml-bucket/
+      --host
+      0.0.0.0
+      --port
+      5001
+
+  dataset:
+    build:
+      context: fruit360-dataset
+      dockerfile: Dockerfile
+    profiles:
+      - setup
+    volumes:
+      - dataset:/dataset
+
+  model_training:
+    build:
+      context: model
+      dockerfile: Dockerfile
+    profiles:
+      - training
+    shm_size: '4gb'
+    environment:
+      MLFLOW_TRACKING_URI: "http://mlflow:5001"
+      AWS_ACCESS_KEY_ID: "minioadmin"
+      AWS_SECRET_ACCESS_KEY: "minioadmin"
+      MLFLOW_S3_ENDPOINT_URL: "http://minio:9000"
+      MLFLOW_DEFAULT_PREDICTION_DEVICE: "cpu"
+      DATA_DIR: "/dataset"
+      CLASSES: "Apple_Red_Delicious,Banana,Corn,Orange,Peach,Pepper_Green,Pineapple,Potato_White,Strawberry,Tomato_1"
+      MODEL_DIR: "./models"
+    volumes:
+      - dataset:/dataset
+
+  model_deployment:
+    image: mlflow:v2.3.1-postgres
+    build:
+      context: mlflow
+      dockerfile: Dockerfile
+    ports:
+      - "5002:5002"
+    profiles:
+      - fullstack
+    environment:
+      MLFLOW_DEFAULT_PREDICTION_DEVICE: "cpu"
+      MLFLOW_TRACKING_URI: postgresql://postgres:postgres@postgres:5432/mlflowdb
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      CLASSES: "Apple_Red_Delicious,Banana,Corn,Orange,Peach,Pepper_Green,Pineapple,Potato_White,Strawberry,Tomato_1"
+    command: >
+      mlflow
+      models
+      serve
+      --model-uri
+      models:/squeezenet/latest
+      --host
+      0.0.0.0
+      --port
+      5002
+
+  flinksql_python:
+    image: flink:1.17-scala_2.12-java11-python3.9
+    profiles:
+      - setup
+    build:
+      context: flinksql-python
+      dockerfile: Dockerfile
+
+  jobmanager:
+    image: flink:1.17-scala_2.12-java11-python3.9
+    expose:
+      - "6123"
+    ports:
+      - "8091:8081"
+    command: jobmanager
+    profiles:
+      - fullstack
+    environment:
+      FLINK_PROPERTIES: |-
+        jobmanager.rpc.address: jobmanager
+        python.client.executable: python3
+        python.executable: python3
+    volumes:
+      - ./sql-python-job-config/app:/sql-python-job-config/app
+      - ./sql-python-job-config/init.sql:/sql-python-job-config/init.sql
+      - ./sql-python-job-config/statement.sql:/sql-python-job-config/statement.sql
+    healthcheck:
+      test: [ "CMD", "bin/flink", "list" ]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 5s
+
+  taskmanager:
+    image: flink:1.17-scala_2.12-java11-python3.9
+    profiles:
+      - fullstack
+    expose:
+      - "6121"
+      - "6122"
+    depends_on:
+      jobmanager:
+        condition: service_healthy
+    volumes:
+      - ./sql-python-job-config/app:/sql-python-job-config/app
+      - ./sql-python-job-config/init.sql:/sql-python-job-config/init.sql
+      - ./sql-python-job-config/statement.sql:/sql-python-job-config/statement.sql
+    command: taskmanager
+    environment:
+      FLINK_PROPERTIES: |-
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        python.client.executable: python3
+        python.executable: python3
+    healthcheck:
+      test: [ "CMD", "grep", "Successful registration at resource manager", "-r", "/opt/flink/log/" ]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 5s
+
+  sqlclient:
+    image: flink:1.17-scala_2.12-java11-python3.9
+    profiles:
+      - fullstack
+    container_name: sqlclient
+    command: /opt/flink/bin/sql-client.sh --init /sql-python-job-config/init.sql --file /sql-python-job-config/statement.sql
+    volumes:
+      - ./sql-python-job-config/app:/sql-python-job-config/app
+      - ./sql-python-job-config/init.sql:/sql-python-job-config/init.sql
+      - ./sql-python-job-config/statement.sql:/sql-python-job-config/statement.sql
+    environment:
+      FLINK_PROPERTIES: |-
+        jobmanager.rpc.address: jobmanager
+        rest.address: jobmanager
+        python.client.executable: python3
+        python.executable: python3
+    depends_on:
+      - taskmanager
+
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.3.2
+    profiles:
+      - fullstack
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_SERVER_ID: 1
+      ZOOKEEPER_SERVERS: zookeeper:2888:3888
+
+  kafka:
+    image: confluentinc/cp-kafka:7.3.2
+    profiles:
+      - fullstack
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+      - "9999:9999"
+    environment:
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:19092,EXTERNAL://${DOCKER_HOST_IP:-127.0.0.1}:9092,DOCKER://host.docker.internal:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,DOCKER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
+      KAFKA_BROKER_ID: 1
+      KAFKA_LOG4J_LOGGERS: "kafka.controller=INFO,kafka.producer.async.DefaultEventHandler=INFO,state.change.logger=INFO"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_JMX_PORT: 9999
+      KAFKA_JMX_HOSTNAME: ${DOCKER_HOST_IP:-127.0.0.1}
+      KAFKA_AUTHORIZER_CLASS_NAME: kafka.security.authorizer.AclAuthorizer
+      KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND: "true"
+    depends_on:
+      - zookeeper
+    healthcheck:
+      test: nc -z localhost 9092 || exit -1
+      start_period: 15s
+      interval: 5s
+      timeout: 10s
+      retries: 10
+
+  init-kafka:
+    image: confluentinc/cp-kafka:7.3.2
+    profiles:
+      - fullstack
+    depends_on:
+      - kafka
+    entrypoint: [ '/bin/sh', '-c' ]
+    command: |
+      "
+      # blocks until kafka is reachable
+      kafka-topics --bootstrap-server kafka:29092 --list
+      
+      echo -e 'Creating kafka topics'
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic image-stream --replication-factor 1 --partitions 1
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic output --replication-factor 1 --partitions 1
+      
+      echo -e 'Successfully created the following topics:'
+      kafka-topics --bootstrap-server kafka:29092 --list
+      "
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.6.2
+    profiles:
+      - fullstack
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "9003:8080"
+
+volumes:
+  database: { }
+  minio_data: { }
+  mlflow_artifacts: { }
+  dataset: { }
