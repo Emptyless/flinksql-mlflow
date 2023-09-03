@@ -66,6 +66,7 @@ services:
       - setup
     volumes:
       - dataset:/dataset
+      - ./fruit360-dataset/cache:/cache
 
   model_training:
     build:

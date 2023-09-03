@@ -6,3 +6,5 @@ model/venv
 model/models
 !model/models/.gitkeep
 sql-python-job-config/venv
+fruit360-dataset/cache/**/*
+!fruit360-dataset/cache/.gitkeep
